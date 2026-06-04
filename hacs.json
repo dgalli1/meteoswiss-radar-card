@@ -1,0 +1,9 @@
+{
+    "name": "MeteoSwiss rain radar card",
+    "render": true,
+    "version": "0.1.0",
+    "country": ["CH"],
+    "homeassistant": "2024.1.0",
+    "filename": "meteoswiss-radar-card.js",
+    "zip_release": false
+}
