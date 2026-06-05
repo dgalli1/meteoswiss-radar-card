@@ -287,31 +287,42 @@ class MeteoSwissRadarCard extends HTMLElement {
   }
 
   _renderBars(entries, now) {
-    // 6 columns: past, now, +0-6h, +6-12h, +12-18h, +18-24h
-    // But the timeline from the AppDaemon is sparse (1 per 5 min for the
-    // first 6h, then 1 per hour for the rest). We render one bar per
-    // entry, sized by time-spacing. That gives a natural-looking chart.
+    // The radar/forecast timeline is one entry per 5 min for the first 6 h,
+    // then one per hour for the rest. To stop the first future bar from
+    // sitting flush against the "now" marker, we visually stretch the
+    // [now, now+5min] window to a fixed 5% slice of the chart so future
+    // entries have a small but visible gap. This matches how the MeteoSwiss
+    // web app draws its scrubber.
     if (entries.length === 0) {
       return `<div class="empty">No timeline data</div>`;
     }
     const minTs = entries[0].ts;
     const maxTs = entries[entries.length - 1].ts;
-    const total = Math.max(1, maxTs - minTs);
+    // Insert a synthetic "now" anchor if the wall clock falls outside the
+    // [minTs, maxTs] window — otherwise the now-marker would sit at the
+    // very edge of the chart and "future" would look like "now".
+    const anchorTs = Math.max(minTs, Math.min(maxTs, now));
+    // Time-domain position (0..1) for the now anchor. The total window
+    // is [minTs, maxTs] and we add a small fixed-width "now" band on
+    // top of that so the marker has a visible footprint.
+    const nowLeft = ((anchorTs - minTs) / Math.max(1, maxTs - minTs)) * 100;
+    const nowBandWidth = 1.2; // % of chart width
     const selectedTs = this._selectedTimestamp;
     return `
       <div class="bars">
         ${entries.map((e) => {
-          const left = ((e.ts - minTs) / total) * 100;
-          const color = e.rate === null ? "#888" : this._colorForBin(e.bin);
+          const left = ((e.ts - minTs) / Math.max(1, maxTs - minTs)) * 100;
+          const color = this._colorForBin(e.bin);
           const isPast = e.ts < now;
           const isSelected = selectedTs === e.ts;
-          const title = `${this._formatTime(e.ts)} — ${e.bin} (${e.rate !== null ? e.rate.toFixed(1) + " mm/h" : "—"})`;
+          const title = `${this._formatTime(e.ts)} \u2014 ${e.bin} (${this._formatRate(e.rate)})`;
           return `<div class="bar ${isPast ? "past" : "future"} ${isSelected ? "selected" : ""}"
                        data-ts="${e.ts}"
                        title="${title}"
                        style="left:${left}%;background:${color}"></div>`;
         }).join("")}
-        <div class="now-marker" style="left:${((now - minTs) / total) * 100}%"></div>
+        <div class="now-band" style="left:calc(${nowLeft}% - ${nowBandWidth / 2}%);width:${nowBandWidth}%"></div>
+        <div class="now-marker" style="left:${nowLeft}%"></div>
       </div>
       <div class="axis">
         <span>${this._formatTime(minTs)}</span>
@@ -373,6 +384,7 @@ class MeteoSwissRadarCard extends HTMLElement {
       .metric .label { font-size: 12px; color: var(--secondary-text-color); margin-top: 2px; }
       .chart { height: 80px; position: relative; margin-bottom: 8px; }
       .bars { position: relative; height: 60px; background: rgba(127,127,127,0.1); border-radius: 4px; overflow: hidden; }
+      .now-band { position: absolute; top: 0; height: 100%; background: rgba(255,255,255,0.18); pointer-events: none; }
       .bar { position: absolute; top: 0; height: 100%; width: 3px; cursor: pointer; transition: transform 0.1s ease, width 0.1s ease; opacity: 0.85; }
       .bar.past { opacity: 0.55; }
       .bar:hover, .bar.selected { transform: scaleX(2.5); width: 4px; opacity: 1; }
