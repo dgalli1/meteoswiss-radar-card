@@ -48,6 +48,7 @@ class MeteoSwissRadarCard extends HTMLElement {
     super();
     this.attachShadow({ mode: "open" });
     this._selectedTimestamp = null; // scrubbed-to step
+    this._clockInterval = null;     // periodic re-render so "now" drifts forward
   }
 
   static getStubConfig() {
@@ -76,6 +77,25 @@ class MeteoSwissRadarCard extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
     this._render();
+    this._ensureClockTicker();
+  }
+
+  disconnectedCallback() {
+    if (this._clockInterval) {
+      clearInterval(this._clockInterval);
+      this._clockInterval = null;
+    }
+  }
+
+  _ensureClockTicker() {
+    // Re-render once per minute so the "now" marker and the "X min ago"
+    // labels keep moving even when the integration hasn't published a
+    // new state. The integration's own scan_interval is 5 min by default;
+    // this is just a visual refresh.
+    if (this._clockInterval) return;
+    this._clockInterval = setInterval(() => {
+      if (this.isConnected) this._render();
+    }, 60_000);
   }
 
   // --- Helpers ----------------------------------------------------------------
@@ -155,6 +175,26 @@ class MeteoSwissRadarCard extends HTMLElement {
     return `${n.toFixed(1)} mm/h`;
   }
 
+  _freshnessLabel(timelineEntity) {
+    if (!timelineEntity || !timelineEntity.attributes) return "no data yet";
+    const last = timelineEntity.attributes.last_refresh;
+    if (!last) return "no data yet";
+    const ageS = Math.max(0, Math.floor(Date.now() / 1000) - last);
+    if (ageS < 60) return `updated just now`;
+    if (ageS < 3600) return `updated ${Math.round(ageS / 60)} min ago`;
+    return `updated ${Math.round(ageS / 3600)} h ago`;
+  }
+
+  _freshnessClass(timelineEntity) {
+    if (!timelineEntity || !timelineEntity.attributes) return "stale";
+    const last = timelineEntity.attributes.last_refresh;
+    if (!last) return "stale";
+    const ageS = Math.max(0, Math.floor(Date.now() / 1000) - last);
+    // Stale = the integration hasn't refreshed in more than 2x its
+    // 5-minute scan interval. (Anything under that is "fine".)
+    return ageS > 600 ? "stale" : "";
+  }
+
   // --- Rendering --------------------------------------------------------------
 
   _render() {
@@ -219,7 +259,12 @@ class MeteoSwissRadarCard extends HTMLElement {
               <span class="swatch" style="background:${currentColor}"></span>
               ${this._config.title} · ${this._config.location_name || ""}
             </h2>
-            <div class="now">${currentState}</div>
+            <div class="header-right">
+              <div class="now">${currentState}</div>
+              <div class="freshness ${this._freshnessClass(timelineEntity)}">
+                ${this._freshnessLabel(timelineEntity)}
+              </div>
+            </div>
           </div>
           ${dryRunBanner ? `<div class="banner">${dryRunBanner}</div>` : ""}
           <div class="summary">
@@ -239,6 +284,7 @@ class MeteoSwissRadarCard extends HTMLElement {
           <div class="chart" id="chart">
             ${this._renderBars(entries, now)}
           </div>
+          ${this._renderSelection(entries)}
           ${this._config.show_legend !== false ? this._renderLegend() : ""}
         </div>
       </ha-card>
@@ -306,40 +352,40 @@ class MeteoSwissRadarCard extends HTMLElement {
 
   _renderBars(entries, now) {
     // The radar/forecast timeline is one entry per 5 min for the first 6 h,
-    // then one per hour for the rest. To stop the first future bar from
-    // sitting flush against the "now" marker, we visually stretch the
-    // [now, now+5min] window to a fixed 5% slice of the chart so future
-    // entries have a small but visible gap. This matches how the MeteoSwiss
-    // web app draws its scrubber.
+    // then one per hour for the rest. We render one bar per entry at its
+    // time position, with the bar's colour matching the MeteoSwiss legend
+    // for that intensity bin. Bars with ``rate === null`` mean the upstream
+    // did not publish a polygon for that point (the point is in a hole in
+    // the radar mosaic); we render those as transparent ticks so the user
+    // can visually distinguish "no rain reported" from "no rain claimed".
     if (entries.length === 0) {
       return `<div class="empty">No timeline data</div>`;
     }
     const minTs = entries[0].ts;
     const maxTs = entries[entries.length - 1].ts;
-    // Insert a synthetic "now" anchor if the wall clock falls outside the
-    // [minTs, maxTs] window — otherwise the now-marker would sit at the
-    // very edge of the chart and "future" would look like "now".
+    const span = Math.max(1, maxTs - minTs);
     const anchorTs = Math.max(minTs, Math.min(maxTs, now));
-    // Time-domain position (0..1) for the now anchor. The total window
-    // is [minTs, maxTs] and we add a small fixed-width "now" band on
-    // top of that so the marker has a visible footprint.
-    const nowLeft = ((anchorTs - minTs) / Math.max(1, maxTs - minTs)) * 100;
-    const nowBandWidth = 1.2; // % of chart width
+    const nowLeft = ((anchorTs - minTs) / span) * 100;
     const selectedTs = this._selectedTimestamp;
     return `
       <div class="bars">
         ${entries.map((e) => {
-          const left = ((e.ts - minTs) / Math.max(1, maxTs - minTs)) * 100;
-          const color = this._colorForBin(e.bin);
+          const left = ((e.ts - minTs) / span) * 100;
           const isPast = e.ts < now;
           const isSelected = selectedTs === e.ts;
+          const isGap = e.rate === null;
+          // Real reading: solid colour. Gap: transparent with a faint
+          // dashed outline so it still parses as a step in the timeline.
+          const color = isGap ? "transparent" : this._colorForBin(e.bin);
+          const border = isGap
+            ? "border-left:1px dashed rgba(127,127,127,0.35);"
+            : "";
           const title = `${this._formatTime(e.ts)} \u2014 ${e.bin} (${this._formatRate(e.rate)})`;
-          return `<div class="bar ${isPast ? "past" : "future"} ${isSelected ? "selected" : ""}"
+          return `<div class="bar ${isPast ? "past" : "future"} ${isGap ? "gap" : ""} ${isSelected ? "selected" : ""}"
                        data-ts="${e.ts}"
                        title="${title}"
-                       style="left:${left}%;background:${color}"></div>`;
+                       style="left:${left}%;background:${color};${border}"></div>`;
         }).join("")}
-        <div class="now-band" style="left:calc(${nowLeft}% - ${nowBandWidth / 2}%);width:${nowBandWidth}%"></div>
         <div class="now-marker" style="left:${nowLeft}%"></div>
       </div>
       <div class="axis">
@@ -352,7 +398,7 @@ class MeteoSwissRadarCard extends HTMLElement {
 
   _renderLegend() {
     const bins = [
-      ["0–1 mm/h", "no rain"],
+      ["0–1 mm/h", "trace"],
       ["1–2 mm/h", ""],
       ["2–4 mm/h", ""],
       ["4–6 mm/h", ""],
@@ -370,6 +416,10 @@ class MeteoSwissRadarCard extends HTMLElement {
             <span>${bin}${note ? ` <em>(${note})</em>` : ""}</span>
           </div>
         `).join("")}
+        <div class="legend-item">
+          <span class="swatch small gap-swatch"></span>
+          <span>no reading <em>(radar mosaic has no polygon at this point)</em></span>
+        </div>
       </div>
     `;
   }
@@ -381,9 +431,48 @@ class MeteoSwissRadarCard extends HTMLElement {
       const bar = ev.target.closest(".bar");
       if (!bar) return;
       const ts = parseInt(bar.getAttribute("data-ts"), 10);
-      this._selectedTimestamp = ts;
+      // Toggle off if the user clicks the already-selected bar; otherwise
+      // pin the new selection so the readout below the chart stays open.
+      this._selectedTimestamp = this._selectedTimestamp === ts ? null : ts;
       this._render();
     });
+    const clear = this.shadowRoot.getElementById("selection-clear");
+    if (clear) {
+      clear.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this._selectedTimestamp = null;
+        this._render();
+      });
+    }
+  }
+
+  _renderSelection(entries) {
+    if (this._selectedTimestamp === null) return "";
+    const e = entries.find((x) => x.ts === this._selectedTimestamp);
+    if (!e) return "";
+    const dateStr = new Date(e.ts * 1000).toLocaleString([], {
+      weekday: "short",
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    const isPast = e.ts < Math.floor(Date.now() / 1000);
+    const phase = isPast ? "Past reading" : "Forecast";
+    const rate = e.rate === null ? "—" : `${e.rate.toFixed(1)} mm/h`;
+    return `
+      <div class="selection" id="selection">
+        <div class="selection-main">
+          <span class="selection-phase">${phase}</span>
+          <span class="selection-date">${dateStr}</span>
+        </div>
+        <div class="selection-detail">
+          <span class="selection-bin">${e.bin}</span>
+          <span class="selection-rate">${rate}</span>
+        </div>
+        <button class="selection-clear" id="selection-clear">Clear</button>
+      </div>
+    `;
   }
 
   _styles() {
@@ -396,6 +485,9 @@ class MeteoSwissRadarCard extends HTMLElement {
       .swatch { display: inline-block; width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgba(0,0,0,0.2); }
       .swatch.small { width: 12px; height: 12px; }
       .now { font-weight: 500; font-size: 16px; }
+      .header-right { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+      .freshness { font-size: 11px; color: var(--secondary-text-color); }
+      .freshness.stale { color: #c46b1f; }
       .banner { background: rgba(154,126,149,0.18); color: var(--primary-text-color); padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 14px; text-align: center; }
       .summary { display: flex; gap: 12px; margin-bottom: 16px; }
       .metric { flex: 1; background: rgba(127,127,127,0.1); padding: 8px 12px; border-radius: 8px; text-align: center; }
@@ -403,15 +495,34 @@ class MeteoSwissRadarCard extends HTMLElement {
       .metric .label { font-size: 12px; color: var(--secondary-text-color); margin-top: 2px; }
       .chart { height: 80px; position: relative; margin-bottom: 8px; }
       .bars { position: relative; height: 60px; background: rgba(127,127,127,0.1); border-radius: 4px; overflow: hidden; }
-      .now-band { position: absolute; top: 0; height: 100%; background: rgba(255,255,255,0.18); pointer-events: none; }
       .bar { position: absolute; top: 0; height: 100%; width: 3px; cursor: pointer; transition: transform 0.1s ease, width 0.1s ease; opacity: 0.85; }
+      .bar.gap { width: 1px; opacity: 1; }
       .bar.past { opacity: 0.55; }
       .bar:hover, .bar.selected { transform: scaleX(2.5); width: 4px; opacity: 1; }
       .now-marker { position: absolute; top: 0; height: 100%; width: 2px; background: var(--primary-text-color); pointer-events: none; }
       .axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--secondary-text-color); padding: 0 2px; }
       .legend { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px 12px; margin-top: 12px; font-size: 12px; }
       .legend-item { display: flex; align-items: center; gap: 6px; }
+      .gap-swatch { background: transparent !important; border-left: 1px dashed rgba(127,127,127,0.6); }
       .empty { color: var(--secondary-text-color); padding: 16px; text-align: center; }
+      .selection { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 12px; margin-top: 8px; background: rgba(127,127,127,0.08); border-radius: 6px; }
+      .selection-main { display: flex; flex-direction: column; gap: 2px; }
+      .selection-phase { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--secondary-text-color); }
+      .selection-date { font-size: 15px; font-weight: 600; }
+      .selection-detail { display: flex; flex-direction: column; gap: 2px; margin-left: auto; text-align: right; }
+      .selection-bin { font-size: 13px; color: var(--secondary-text-color); }
+      .selection-rate { font-size: 16px; font-weight: 600; }
+      .selection-clear { background: transparent; border: 1px solid var(--divider-color, rgba(127,127,127,0.4)); color: var(--primary-text-color); border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+      .selection-clear:hover { background: rgba(127,127,127,0.12); }
+      .selection { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 12px; margin-top: 8px; background: rgba(127,127,127,0.08); border-radius: 6px; }
+      .selection-main { display: flex; flex-direction: column; gap: 2px; }
+      .selection-phase { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--secondary-text-color); }
+      .selection-date { font-size: 15px; font-weight: 600; }
+      .selection-detail { display: flex; flex-direction: column; gap: 2px; margin-left: auto; text-align: right; }
+      .selection-bin { font-size: 13px; color: var(--secondary-text-color); }
+      .selection-rate { font-size: 16px; font-weight: 600; }
+      .selection-clear { background: transparent; border: 1px solid var(--divider-color, rgba(127,127,127,0.4)); color: var(--primary-text-color); border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+      .selection-clear:hover { background: rgba(127,127,127,0.12); }
     `;
   }
 }
