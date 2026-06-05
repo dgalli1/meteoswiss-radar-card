@@ -206,6 +206,10 @@ class MeteoSwissRadarCard extends HTMLElement {
     if (!isFinite(max6h)) {
       max6h = this._deriveMax6h(entries, now);
     }
+    // Detect a "no rain in window" forecast: every future entry with a
+    // non-null rate sits in the lowest bin (0-1 mm/h). In that case the
+    // card surfaces a clear banner instead of a wall of identical bars.
+    const dryRunBanner = this._detectDryRun(entries, now);
 
     this.shadowRoot.innerHTML = `
       <ha-card>
@@ -217,6 +221,7 @@ class MeteoSwissRadarCard extends HTMLElement {
             </h2>
             <div class="now">${currentState}</div>
           </div>
+          ${dryRunBanner ? `<div class="banner">${dryRunBanner}</div>` : ""}
           <div class="summary">
             <div class="metric">
               <div class="value">${this._formatRain(nextRain)}</div>
@@ -240,6 +245,19 @@ class MeteoSwissRadarCard extends HTMLElement {
       <style>${this._styles()}</style>
     `;
     this._bindScrubber(entries, now);
+  }
+
+  _detectDryRun(entries, now) {
+    // If every future entry with a real (non-null) rate sits in the
+    // lowest bin, the forecast is effectively dry for the whole window.
+    const future = entries.filter((e) => e.ts > now && e.rate !== null);
+    if (future.length === 0) return null;
+    const anyRain = future.some((e) => e.rate >= 1.0);
+    if (anyRain) return null;
+    const horizonH = Math.round(
+      (entries[entries.length - 1].ts - now) / 3600
+    );
+    return `No rain expected in the next ${horizonH} h`;
   }
 
   _renderWaiting(message) {
@@ -378,6 +396,7 @@ class MeteoSwissRadarCard extends HTMLElement {
       .swatch { display: inline-block; width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgba(0,0,0,0.2); }
       .swatch.small { width: 12px; height: 12px; }
       .now { font-weight: 500; font-size: 16px; }
+      .banner { background: rgba(154,126,149,0.18); color: var(--primary-text-color); padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 14px; text-align: center; }
       .summary { display: flex; gap: 12px; margin-bottom: 16px; }
       .metric { flex: 1; background: rgba(127,127,127,0.1); padding: 8px 12px; border-radius: 8px; text-align: center; }
       .metric .value { font-size: 20px; font-weight: 600; }
