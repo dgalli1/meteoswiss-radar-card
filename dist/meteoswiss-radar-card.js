@@ -9,23 +9,39 @@
  *  * A "next rain in N min" pill (or "dry" if the next 6 h are rain-free).
  *  * A scrubber so the user can preview any historical or forecast step.
  *
- * The card reads the ``sensor.meteoswiss_radar_timeline`` entity (JSON
- * attribute produced by the AppDaemon app) plus the current state. It
- * renders everything from the data; no map is embedded (the upstream
- * MeteoSwiss radar page is iframe-blocked, and the AppDaemon app already
- * has the full data so the client doesn't need a map).
+ * The card reads the integration's per-location timeline sensor
+ * (e.g. ``sensor.meteoswiss_radar_romanshorn_timeline_steps``) and
+ * derives the current rate / next rain / forecast max from its
+ * attributes, so you only have to set one ``entity`` in the card
+ * config. Optional separate ``current_rate_entity`` / ``next_rain_entity``
+ * / ``forecast_max_6h_entity`` overrides are honored when present.
  *
  * To install:
- *   1. Drop this file into ``config/www/meteoswiss-radar-card.js`` in your
- *      Home Assistant config dir.
- *   2. Add a Lovelace resource for it (Settings → Dashboards → Resources):
- *        URL:  /local/meteoswiss-radar-card.js
+ *   1. HACS installs the file under
+ *      ``config/www/community/meteoswiss-radar-card/meteoswiss-radar-card.js``.
+ *   2. Add a Lovelace resource (Settings → Dashboards → Resources):
+ *        URL:  /local/community/meteoswiss-radar-card/meteoswiss-radar-card.js
  *        Type: JavaScript Module
  *   3. Add the card to a view:
  *        type: custom:meteoswiss-radar-card
- *        entity: sensor.meteoswiss_radar_timeline
+ *        entity: sensor.meteoswiss_radar_romanshorn_timeline_steps
  *        location_name: Romanshorn
  */
+
+const COLOR_MAP = {
+  "0–1 mm/h": "#9a7e95",
+  "1–2 mm/h": "#0001fc",
+  "2–4 mm/h": "#058c2d",
+  "4–6 mm/h": "#05ff05",
+  "6–10 mm/h": "#feff01",
+  "10–20 mm/h": "#ffc703",
+  "20–40 mm/h": "#ff7d01",
+  "40–60 mm/h": "#ff1900",
+  "60+ mm/h": "#af00dd",
+  "no data": "#cccccc",
+  "storm warning": "#333e48",
+  "unknown": "#888888",
+};
 
 class MeteoSwissRadarCard extends HTMLElement {
   constructor() {
@@ -36,7 +52,7 @@ class MeteoSwissRadarCard extends HTMLElement {
 
   static getStubConfig() {
     return {
-      entity: "sensor.meteoswiss_radar_timeline",
+      entity: "sensor.meteoswiss_radar_romanshorn_timeline_steps",
       location_name: "Romanshorn",
       title: "MeteoSwiss rain radar",
       show_legend: true,
@@ -44,8 +60,10 @@ class MeteoSwissRadarCard extends HTMLElement {
   }
 
   setConfig(config) {
-    if (!config.entity) {
-      throw new Error("Please define an entity (e.g. sensor.meteoswiss_radar_timeline)");
+    if (!config || !config.entity) {
+      throw new Error(
+        "Please define an entity (e.g. sensor.meteoswiss_radar_romanshorn_timeline_steps)"
+      );
     }
     this._config = {
       title: "MeteoSwiss rain radar",
@@ -63,85 +81,131 @@ class MeteoSwissRadarCard extends HTMLElement {
   // --- Helpers ----------------------------------------------------------------
 
   _getEntity(entityId) {
-    return this._hass && this._hass.states[entityId];
+    return this._hass && this._hass.states ? this._hass.states[entityId] : null;
+  }
+
+  _timelineEntity() {
+    return this._getEntity(this._config.entity);
   }
 
   _timelineAttr() {
-    const entity = this._getEntity(this._config.entity);
+    const entity = this._timelineEntity();
     if (!entity) return null;
     return entity.attributes && entity.attributes.timeline
       ? entity.attributes.timeline
       : null;
   }
 
-  _currentRate() {
-    return this._getEntity("sensor.meteoswiss_radar_current_rate");
+  // Optional side entities. All are tolerant of missing / unavailable
+  // values so a partial deployment still renders.
+  _currentStateEntity() {
+    return this._getEntity(this._config.current_state_entity)
+      || this._getEntity(this._inferSibling("_current_intensity_bin"));
   }
-  _currentState() {
-    return this._getEntity("sensor.meteoswiss_radar_current_state");
+
+  _nextRainEntity() {
+    return this._getEntity(this._config.next_rain_entity)
+      || this._getEntity(this._inferSibling("_next_rain_in"));
   }
-  _nextRain() {
-    return this._getEntity("sensor.meteoswiss_radar_next_rain");
+
+  _forecastMax6hEntity() {
+    return this._getEntity(this._config.forecast_max_6h_entity)
+      || this._getEntity(this._inferSibling("_forecast_max_6h"));
   }
-  _forecastMax6h() {
-    return this._getEntity("sensor.meteoswiss_radar_forecast_max_6h");
+
+  // Strip the ``_timeline_steps`` suffix from the configured entity to
+  // re-use the integration's per-location prefix.
+  _inferSibling(suffix) {
+    const id = this._config.entity || "";
+    if (!id.endsWith("_timeline_steps")) return "";
+    return id.slice(0, -"_timeline_steps".length) + suffix;
   }
 
   _colorForBin(binLabel) {
-    // Match the AppDaemon app's colour map (matches MeteoSwiss legend).
-    const map = {
-      "0–1 mm/h": "#9a7e95",
-      "1–2 mm/h": "#0001fc",
-      "2–4 mm/h": "#058c2d",
-      "4–6 mm/h": "#05ff05",
-      "6–10 mm/h": "#feff01",
-      "10–20 mm/h": "#ffc703",
-      "20–40 mm/h": "#ff7d01",
-      "40–60 mm/h": "#ff1900",
-      "60+ mm/h": "#af00dd",
-      "no data": "#ffffff",
-      warning: "#333e48",
-      unknown: "#888888",
-    };
-    return map[binLabel] || "#888888";
+    return COLOR_MAP[binLabel] || "#888888";
   }
 
   _formatTime(ts) {
+    if (!ts) return "—";
     const d = new Date(ts * 1000);
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 
-  _formatDate(ts) {
-    const d = new Date(ts * 1000);
-    return d.toLocaleDateString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  _formatRain(value) {
+    if (value === null || value === undefined) return "—";
+    if (value === "unknown" || value === "unavailable") return "—";
+    if (typeof value === "number") {
+      if (!isFinite(value)) return "—";
+      if (value === 0) return "now";
+      if (value < 60) return `${value} min`;
+      return `${Math.round(value / 60)} h`;
+    }
+    const n = parseFloat(value);
+    if (isNaN(n)) return String(value);
+    if (n === 0) return "now";
+    if (n < 60) return `${n} min`;
+    return `${Math.round(n / 60)} h`;
+  }
+
+  _formatRate(value) {
+    if (value === null || value === undefined) return "—";
+    if (value === "unknown" || value === "unavailable") return "—";
+    const n = parseFloat(value);
+    if (!isFinite(n)) return "—";
+    return `${n.toFixed(1)} mm/h`;
   }
 
   // --- Rendering --------------------------------------------------------------
 
   _render() {
     if (!this._config || !this._hass) return;
+
+    const timelineEntity = this._timelineEntity();
     const timeline = this._timelineAttr();
+
+    if (!timelineEntity) {
+      this._renderWaiting(
+        `Entity not found: <code>${this._config.entity}</code>. ` +
+          `Add a MeteoSwiss radar location first.`
+      );
+      return;
+    }
     if (!timeline) {
-      this.shadowRoot.innerHTML = `
-        <ha-card>
-          <div class="card">
-            <div class="header"><h2>${this._config.title}</h2></div>
-            <div class="empty">Waiting for data from <code>${this._config.entity}</code>…</div>
-          </div>
-        </ha-card>
-        <style>${this._styles()}</style>
-      `;
+      this._renderWaiting(
+        `Waiting for timeline data on <code>${this._config.entity}</code>…`
+      );
       return;
     }
 
-    const entries = Object.values(timeline).sort((a, b) => a.ts - b.ts);
+    const entries = Object.values(timeline)
+      .map((e) => ({
+        ts: Number(e.ts),
+        rate: e.rate === undefined || e.rate === null ? null : Number(e.rate),
+        bin: e.bin || "no data",
+      }))
+      .filter((e) => isFinite(e.ts))
+      .sort((a, b) => a.ts - b.ts);
+
+    if (entries.length === 0) {
+      this._renderWaiting("Timeline is empty.");
+      return;
+    }
+
     const now = Math.floor(Date.now() / 1000);
-    const currentState = this._currentState() ? this._currentState().state : "—";
+    const currentStateEntity = this._currentStateEntity();
+    const currentState = currentStateEntity
+      ? currentStateEntity.state
+      : this._pickCurrentBin(entries, now);
     const currentColor = this._colorForBin(currentState);
-    const nextRainEntity = this._nextRain();
-    const nextRain = nextRainEntity ? nextRainEntity.state : null;
-    const max6hEntity = this._forecastMax6h();
-    const max6h = max6hEntity ? max6hEntity.state : 0;
+    const nextRainEntity = this._nextRainEntity();
+    const nextRain = nextRainEntity
+      ? nextRainEntity.state
+      : this._deriveNextRain(entries, now);
+    const max6hEntity = this._forecastMax6hEntity();
+    let max6h = max6hEntity ? parseFloat(max6hEntity.state) : NaN;
+    if (!isFinite(max6h)) {
+      max6h = this._deriveMax6h(entries, now);
+    }
 
     this.shadowRoot.innerHTML = `
       <ha-card>
@@ -159,7 +223,7 @@ class MeteoSwissRadarCard extends HTMLElement {
               <div class="label">Next rain</div>
             </div>
             <div class="metric">
-              <div class="value">${(max6h || 0).toFixed ? (max6h).toFixed(1) : max6h} mm/h</div>
+              <div class="value">${this._formatRate(max6h)}</div>
               <div class="label">Max 6h</div>
             </div>
             <div class="metric">
@@ -178,16 +242,48 @@ class MeteoSwissRadarCard extends HTMLElement {
     this._bindScrubber(entries, now);
   }
 
-  _formatRain(value) {
-    if (value === null || value === undefined || value === "unknown" || value === "unavailable") {
-      return "—";
+  _renderWaiting(message) {
+    this.shadowRoot.innerHTML = `
+      <ha-card>
+        <div class="card">
+          <div class="header"><h2>${this._config.title}</h2></div>
+          <div class="empty">${message}</div>
+        </div>
+      </ha-card>
+      <style>${this._styles()}</style>
+    `;
+  }
+
+  _pickCurrentBin(entries, now) {
+    let best = null;
+    for (const e of entries) {
+      if (e.ts <= now) best = e;
     }
-    if (typeof value === "number") {
-      if (value === 0) return "now";
-      if (value < 60) return `${value} min`;
-      return `${Math.round(value / 60)} h`;
+    return best ? best.bin : (entries[0] ? entries[0].bin : "no data");
+  }
+
+  _deriveNextRain(entries, now) {
+    for (const e of entries) {
+      if (e.ts > now && e.rate !== null && e.rate > 0) {
+        return Math.max(0, Math.round((e.ts - now) / 60));
+      }
     }
-    return String(value);
+    return null;
+  }
+
+  _deriveMax6h(entries, now) {
+    const horizon = now + 6 * 3600;
+    let max = 0;
+    let any = false;
+    for (const e of entries) {
+      if (e.ts < now) continue;
+      if (e.ts > horizon) break;
+      if (e.rate !== null && e.rate > max) {
+        max = e.rate;
+        any = true;
+      }
+    }
+    return any ? max : null;
   }
 
   _renderBars(entries, now) {
